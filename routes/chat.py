@@ -79,6 +79,75 @@ logger = logging.getLogger(__name__)
 bp = Blueprint('chat', __name__)
 
 
+def _openai_stream_thinking_acc_create() -> dict[str, Any]:
+    """聚合 CC 流式 delta，用于在回合结束时写入 thinking_cache。"""
+    return {'reasoning_parts': [], 'content_parts': [], 'tool_calls': {}}
+
+
+def _openai_stream_thinking_acc_append(state: dict[str, Any], chunk: dict[str, Any]) -> None:
+    """从单个 CC chunk 提取 delta 并写入聚合状态。"""
+    choices = chunk.get('choices')
+    if not isinstance(choices, list) or not choices:
+        return
+    choice0 = choices[0]
+    if not isinstance(choice0, dict):
+        return
+    delta = choice0.get('delta')
+    if not isinstance(delta, dict):
+        return
+
+    if 'reasoning_content' in delta and isinstance(delta['reasoning_content'], str):
+        state['reasoning_parts'].append(delta['reasoning_content'])
+
+    if 'content' in delta and isinstance(delta['content'], str):
+        state['content_parts'].append(delta['content'])
+
+    for tc in delta.get('tool_calls') or []:
+        if not isinstance(tc, dict):
+            continue
+        idx = int(tc.get('index', 0))
+        bucket = state['tool_calls'].setdefault(
+            idx,
+            {'id': '', 'type': 'function', 'function': {'name': '', 'arguments': ''}},
+        )
+        if tc.get('id'):
+            bucket['id'] = str(tc['id'])
+        if tc.get('type'):
+            bucket['type'] = str(tc['type'])
+        fn = tc.get('function')
+        if isinstance(fn, dict):
+            if fn.get('name'):
+                bucket['function']['name'] = str(fn['name'])
+            if fn.get('arguments'):
+                bucket['function']['arguments'] += str(fn['arguments'])
+
+
+def _assistant_message_from_openai_stream_acc(acc: dict[str, Any]) -> dict[str, Any] | None:
+    """将聚合状态转为 assistant 消息字典；无 reasoning 时不缓存。"""
+    reasoning = ''.join(acc.get('reasoning_parts', []))
+    if not reasoning:
+        return None
+    content = ''.join(acc.get('content_parts', []))
+    tc_map: dict[int, Any] = acc.get('tool_calls') or {}
+    msg: dict[str, Any] = {'role': 'assistant', 'reasoning_content': reasoning}
+    if tc_map:
+        msg['tool_calls'] = [tc_map[i] for i in sorted(tc_map.keys())]
+        msg['content'] = content if content else None
+    else:
+        msg['content'] = content if content else None
+    return msg
+
+
+def _store_assistant_thinking_from_openai_stream(
+    request_messages: list[dict[str, Any]],
+    acc: dict[str, Any],
+) -> None:
+    """OpenAI 兼容流式回合结束后，按 assistant 形状写入 thinking_cache。"""
+    assistant_msg = _assistant_message_from_openai_stream_acc(acc)
+    if assistant_msg:
+        thinking_cache.store_assistant_thinking(request_messages, assistant_msg)
+
+
 def _dbg(message: str) -> None:
     """仅在调试模式下输出详细日志。"""
     if settings.get_debug_mode() in ('simple', 'verbose'):
@@ -232,6 +301,7 @@ def _handle_openai_stream(
             return
 
         think_extractor = ThinkTagExtractor()
+        stream_acc = _openai_stream_thinking_acc_create()
         chunk_count = 0
         last_usage = None
         client_chunks: list[dict[str, Any]] = []
@@ -258,6 +328,7 @@ def _handle_openai_stream(
                     'chunk_count': len(client_chunks),
                     'usage': last_usage,
                 })
+                _store_assistant_thinking_from_openai_stream(payload['messages'], stream_acc)
                 finalize_turn(turn, usage=last_usage)
                 return
 
@@ -272,6 +343,7 @@ def _handle_openai_stream(
                 )
 
             chunk = fix_stream_chunk(chunk)
+            _openai_stream_thinking_acc_append(stream_acc, chunk)
             chunk['model'] = ctx.client_model
 
             for out in think_extractor.process_chunk(chunk):
@@ -299,6 +371,7 @@ def _handle_openai_stream(
             'chunk_count': len(client_chunks),
             'usage': last_usage,
         })
+        _store_assistant_thinking_from_openai_stream(payload['messages'], stream_acc)
         finalize_turn(turn, usage=last_usage)
 
     return sse_response(generate())
@@ -700,13 +773,12 @@ def _finalize_chat_response(
     attach_client_response(turn, data)
     finalize_turn(turn, usage=data.get('usage'))
 
+    req_body = request.get_json(silent=True, force=True) or {}
+    client_msgs = req_body.get('messages', [])
     for choice in data.get('choices', []):
         msg = choice.get('message', {})
         if msg.get('reasoning_content'):
-            thinking_cache.store_from_response(
-                request.get_json(silent=True, force=True).get('messages', []),
-                msg['reasoning_content'],
-            )
+            thinking_cache.store_assistant_thinking(client_msgs, msg)
             break
 
     return jsonify(data)

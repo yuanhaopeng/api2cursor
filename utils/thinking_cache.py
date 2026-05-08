@@ -48,23 +48,6 @@ class ThinkingCache:
 
         return messages
 
-    def store_from_response(
-        self,
-        messages: list[dict[str, Any]],
-        reasoning_content: str,
-    ) -> None:
-        """将响应中的 thinking 内容存入缓存。"""
-        if not reasoning_content:
-            return
-        sid = self._session_id(messages)
-        if not sid:
-            return
-
-        fake_msg: dict[str, Any] = {'role': 'assistant', 'content': '', 'tool_calls': []}
-        key = sid + ':' + self._message_hash(fake_msg)
-        self._store[key] = (reasoning_content, time.time())
-        self._cleanup()
-
     def store_assistant_thinking(
         self,
         messages: list[dict[str, Any]],
@@ -82,28 +65,24 @@ class ThinkingCache:
         self._cleanup()
 
     def _session_id(self, messages: list[dict[str, Any]]) -> str:
+        """用首条用户消息内容派生会话键。
+
+        此前实现还要求首条 assistant 已存在，导致第一轮 assistant 回复无法在请求阶段
+        落库（inject 需要 sid，而首轮请求里没有 assistant），继而下一轮必然缺 reasoning。
+        """
         first_user = ''
-        first_assistant = ''
         for msg in messages:
             role = msg.get('role', '')
             if role in ('system', 'developer'):
                 continue
             if role == 'user' and not first_user:
-                first_user = self._normalize_content(
-                    msg.get('content', '')
-                )
-            elif role == 'assistant' and not first_assistant:
-                first_assistant = self._normalize_content(
-                    msg.get('content', '')
-                )
-            if first_user and first_assistant:
+                first_user = self._normalize_content(msg.get('content', ''))
                 break
 
-        if not first_user or not first_assistant:
+        if not first_user:
             return ''
 
-        raw = first_user + '|' + first_assistant
-        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+        return hashlib.sha256(first_user.encode()).hexdigest()[:16]
 
     def _message_hash(self, msg: dict[str, Any]) -> str:
         content = self._normalize_content(msg.get('content', ''))
