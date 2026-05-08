@@ -85,41 +85,47 @@ def _openai_stream_thinking_acc_create() -> dict[str, Any]:
 
 
 def _openai_stream_thinking_acc_append(state: dict[str, Any], chunk: dict[str, Any]) -> None:
-    """从单个 CC chunk 提取 delta 并写入聚合状态。"""
-    choices = chunk.get('choices')
-    if not isinstance(choices, list) or not choices:
-        return
-    choice0 = choices[0]
-    if not isinstance(choice0, dict):
-        return
-    delta = choice0.get('delta')
-    if not isinstance(delta, dict):
-        return
+    """从单个 CC chunk 提取 delta 并写入聚合状态。
 
-    if 'reasoning_content' in delta and isinstance(delta['reasoning_content'], str):
-        state['reasoning_parts'].append(delta['reasoning_content'])
+    此函数仅用于缓存写入的辅助收集，绝不能影响主流式响应路径。
+    """
+    try:
+        choices = chunk.get('choices')
+        if not isinstance(choices, list) or not choices:
+            return
+        choice0 = choices[0]
+        if not isinstance(choice0, dict):
+            return
+        delta = choice0.get('delta')
+        if not isinstance(delta, dict):
+            return
 
-    if 'content' in delta and isinstance(delta['content'], str):
-        state['content_parts'].append(delta['content'])
+        if 'reasoning_content' in delta and isinstance(delta['reasoning_content'], str):
+            state['reasoning_parts'].append(delta['reasoning_content'])
 
-    for tc in delta.get('tool_calls') or []:
-        if not isinstance(tc, dict):
-            continue
-        idx = int(tc.get('index', 0))
-        bucket = state['tool_calls'].setdefault(
-            idx,
-            {'id': '', 'type': 'function', 'function': {'name': '', 'arguments': ''}},
-        )
-        if tc.get('id'):
-            bucket['id'] = str(tc['id'])
-        if tc.get('type'):
-            bucket['type'] = str(tc['type'])
-        fn = tc.get('function')
-        if isinstance(fn, dict):
-            if fn.get('name'):
-                bucket['function']['name'] = str(fn['name'])
-            if fn.get('arguments'):
-                bucket['function']['arguments'] += str(fn['arguments'])
+        if 'content' in delta and isinstance(delta['content'], str):
+            state['content_parts'].append(delta['content'])
+
+        for tc in delta.get('tool_calls') or []:
+            if not isinstance(tc, dict):
+                continue
+            idx = int(tc.get('index') or 0)
+            bucket = state['tool_calls'].setdefault(
+                idx,
+                {'id': '', 'type': 'function', 'function': {'name': '', 'arguments': ''}},
+            )
+            if tc.get('id'):
+                bucket['id'] = str(tc['id'])
+            if tc.get('type'):
+                bucket['type'] = str(tc['type'])
+            fn = tc.get('function')
+            if isinstance(fn, dict):
+                if fn.get('name'):
+                    bucket['function']['name'] = str(fn['name'])
+                if fn.get('arguments'):
+                    bucket['function']['arguments'] += str(fn['arguments'])
+    except Exception:
+        pass
 
 
 def _assistant_message_from_openai_stream_acc(acc: dict[str, Any]) -> dict[str, Any] | None:
@@ -143,9 +149,12 @@ def _store_assistant_thinking_from_openai_stream(
     acc: dict[str, Any],
 ) -> None:
     """OpenAI 兼容流式回合结束后，按 assistant 形状写入 thinking_cache。"""
-    assistant_msg = _assistant_message_from_openai_stream_acc(acc)
-    if assistant_msg:
-        thinking_cache.store_assistant_thinking(request_messages, assistant_msg)
+    try:
+        assistant_msg = _assistant_message_from_openai_stream_acc(acc)
+        if assistant_msg:
+            thinking_cache.store_assistant_thinking(request_messages, assistant_msg)
+    except Exception:
+        pass
 
 
 def _sanitize_reasoning_fields(messages: list[dict[str, Any]]) -> None:
