@@ -148,6 +148,21 @@ def _store_assistant_thinking_from_openai_stream(
         thinking_cache.store_assistant_thinking(request_messages, assistant_msg)
 
 
+def _sanitize_reasoning_fields(messages: list[dict[str, Any]]) -> None:
+    """清理 messages 中 assistant 的 reasoning_content 字段。
+
+    DeepSeek 要求：如果 assistant 消息带了 reasoning_content，值不能为空；
+    如果没有 reasoning 内容，就不应存在该字段。Cursor 有时会把空字符串或 null
+    留在消息里，导致上游 400 报错。
+    """
+    for msg in messages:
+        if msg.get('role') != 'assistant':
+            continue
+        rc = msg.get('reasoning_content')
+        if rc is None or (isinstance(rc, str) and not rc.strip()):
+            msg.pop('reasoning_content', None)
+
+
 def _dbg(message: str) -> None:
     """仅在调试模式下输出详细日志。"""
     if settings.get_debug_mode() in ('simple', 'verbose'):
@@ -199,6 +214,7 @@ def chat_completions():
 
     if ctx.backend != 'responses':
         payload['messages'] = thinking_cache.inject(payload.get('messages', []))
+        _sanitize_reasoning_fields(payload.get('messages', []))
 
     if ctx.backend == 'openai':
         return _handle_openai_backend(ctx, payload, turn)
